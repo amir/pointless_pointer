@@ -90,6 +90,7 @@ struct YamlValueCollector {
     mapping_depth: usize,
     current_sequence_items: Vec<String>, // Collect items in current sequence
     sequence_start_line: usize,
+    sequence_depth: usize, // Track how deeply nested we are in sequences
 }
 
 impl YamlValueCollector {
@@ -103,6 +104,7 @@ impl YamlValueCollector {
             mapping_depth: 0,
             current_sequence_items: Vec::new(),
             sequence_start_line: 0,
+            sequence_depth: 0,
         }
     }
 }
@@ -116,20 +118,30 @@ impl<'input> SpannedEventReceiver<'input> for YamlValueCollector {
                     self.current_path.push(key.clone());
                 }
                 self.mapping_depth += 1;
-                self.state = ParseState::ExpectingKey;
+                // If we're in a sequence, stay in the InSequence state
+                if self.sequence_depth == 0 {
+                    self.state = ParseState::ExpectingKey;
+                }
             }
             Event::MappingEnd => {
                 self.mapping_depth -= 1;
-                if !self.current_path.is_empty() && self.current_path.len() >= self.mapping_depth {
+                if !self.current_path.is_empty()
+                    && self.current_path.len() >= self.mapping_depth
+                    && self.sequence_depth == 0
+                {
                     self.current_path.pop();
                 }
-                self.state = if self.mapping_depth > 0 {
-                    ParseState::ExpectingKey
-                } else {
-                    ParseState::Idle
-                };
+                // If we're not in a sequence, update the state
+                if self.sequence_depth == 0 {
+                    self.state = if self.mapping_depth > 0 {
+                        ParseState::ExpectingKey
+                    } else {
+                        ParseState::Idle
+                    };
+                }
             }
             Event::SequenceStart(_, _) => {
+                self.sequence_depth += 1;
                 if let ParseState::ExpectingValue(key) = &self.state {
                     // This is a sequence as a value - start collecting sequence items
                     self.current_path.push(key.clone());
@@ -140,8 +152,9 @@ impl<'input> SpannedEventReceiver<'input> for YamlValueCollector {
                 self.sequence_index = 0;
             }
             Event::SequenceEnd => {
+                self.sequence_depth -= 1;
                 // End of sequence - record the entire sequence as one value
-                if !self.current_path.is_empty() {
+                if !self.current_path.is_empty() && self.sequence_depth == 0 {
                     let sequence_value = format!("[{}]", self.current_sequence_items.join(", "));
                     self.values.push((
                         self.current_path.clone(),
@@ -168,18 +181,21 @@ impl<'input> SpannedEventReceiver<'input> for YamlValueCollector {
                     }
                     ParseState::ExpectingValue(key) => {
                         // This is a scalar value for the key
-                        let mut value_path = self.current_path.clone();
-                        value_path.push(key.clone());
+                        // Only collect values if we're not inside a sequence
+                        if self.sequence_depth == 0 {
+                            let mut value_path = self.current_path.clone();
+                            value_path.push(key.clone());
 
-                        let line = span.start.line();
-                        self.values.push((
-                            value_path,
-                            ValueWithLocation {
-                                value: value.into_owned(),
-                                file: self.current_file.clone(),
-                                line,
-                            },
-                        ));
+                            let line = span.start.line();
+                            self.values.push((
+                                value_path,
+                                ValueWithLocation {
+                                    value: value.into_owned(),
+                                    file: self.current_file.clone(),
+                                    line,
+                                },
+                            ));
+                        }
 
                         self.state = ParseState::ExpectingKey;
                     }
